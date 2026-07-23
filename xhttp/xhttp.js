@@ -1,678 +1,383 @@
-// 温馨提示：绑定自定义域名后，需要在域名下左侧的网络菜单开启GRPC功能，否则不通
+// ============================================================
+// Cloudflare Workers Shadowsocks Proxy (Pages 部署版)
+// 基于 Cloudflare Pages 的 Shadowsocks 代理服务
+// ============================================================
+// 环境变量说明:
+//   PASSWORD / PASSWD / password   - 主页访问密码（默认: 123456）
+//   UUID / uuid                    - 用户 UUID（自动生成）
+//   PROXYIP / proxyip / proxyIP    - 代理服务器 IP，逗号分隔多个
+//   SUB_PATH / subpath             - 订阅路径（默认: link）
+// ============================================================
 
-import { connect } from 'cloudflare:sockets'
+import { connect } from 'cloudflare:sockets';
 
-const proxyIP = '13.230.34.30';  // proxyIP 用于访问cf cdn网站，例如chatgpt
-const yourUUID = '00000000-0000-4000-8000-000000000000'; // UUID
+// ---------------------- 配置区 ----------------------
 
-let cfip = [ 
-    'mfa.gov.ua', 'saas.sin.fan', 'store.ubi.com','cf.130519.xyz','cf.008500.xyz', 
-    'cf.090227.xyz', 'cf.877774.xyz','cdns.doon.eu.org','sub.danfeng.eu.org','cf.zhetengsha.eu.org'
-]; 
+const CONFIG = {
+	/** @type {string} 订阅路径 */
+	subPath: 'link',
 
-let ACTIVE_CONNECTIONS = 0;
-const BUFFER_SIZE = 512 * 1024;
-const CONNECT_TIMEOUT_MS = 3000;
-const IDLE_TIMEOUT_MS = 30000;
-const MAX_RETRIES = 2;
-const MAX_CONCURRENT = 64;
-const activeConnections = new WeakMap();
-const activeStreams = new WeakMap();
-function get_buffer(size) { return new Uint8Array(size || BUFFER_SIZE) }
-const ADDRESS_TYPE_IPV4 = 1, ADDRESS_TYPE_URL = 2, ADDRESS_TYPE_IPV6 = 3;
-function parse_uuid(uuid) {
-    uuid = uuid.replaceAll('-', '')
-    const r = []
-    for (let i = 0; i < 16; i++) r.push(parseInt(uuid.substr(i * 2, 2), 16))
-    return r
+	/** @type {string} 节点 UUID（SS 密码） */
+	uuid: generateUUID(),
+
+	/** @type {string} 代理服务器 IP */
+	proxyIP: '',
+
+	/** @type {string} 主页访问密码 */
+	password: '123456',
+
+	/** @type {string} SS 路径验证（为空则使用 UUID） */
+	ssPath: '',
+
+	/** @type {Array<string>} CDN 优选节点列表 */
+	cfips: [
+		'cf.008500.xyz:443#HK-01',
+		'cf.090227.xyz:443#SG-01',
+		'cf.877774.xyz:443#HK-02',
+		'saas.sin.fan:443#JP-01',
+		'cdns.doon.eu.org:443#JP-02',
+		'sub.danfeng.eu.org:443#TW-01',
+		'cf.zhetengsha.eu.org:443#HK-03',
+		'mfa.gov.ua:443#SG-02',
+		'store.ubi.com:443#JP-03',
+		'cf.130519.xyz:443#KR-01',
+	],
+};
+
+const DEFAULT_PROXY_IP = 'proxy.xxxxxxxx.tk:50001';
+const WS_OPEN = 1;
+const WS_CLOSING = 2;
+
+// ---------------------- 工具函数 ----------------------
+
+function generateUUID() {
+	return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+		const r = (Math.random() * 16) | 0;
+		const v = c === 'x' ? r : (r & 0x3) | 0x8;
+		return v.toString(16);
+	});
 }
 
-function validate_uuid(id, uuid) {
-    for (let i = 0; i < 16; i++) if (id[i] !== uuid[i]) return false
-    return true
+function closeSocketQuietly(socket) {
+	try {
+		if (socket && socket.readyState !== undefined &&
+			(socket.readyState === WS_OPEN || socket.readyState === WS_CLOSING)) {
+			socket.close();
+		}
+	} catch (_) {}
 }
 
-function concat_typed_arrays(first, ...args) {
-    let len = first.length
-    for (let a of args) len += a.length
-    const r = new first.constructor(len)
-    r.set(first, 0)
-    len = first.length
-    for (let a of args) { r.set(a, len); len += a.length }
-    return r
+function base64ToArrayBuffer(b64) {
+	if (!b64) return { earlyData: null, error: null };
+	try {
+		const binary = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+		const bytes = new Uint8Array(binary.length);
+		for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+		return { earlyData: bytes.buffer, error: null };
+	} catch (e) { return { earlyData: null, error: e }; }
 }
 
-async function read_header(readable, uuid_str) {
-    const reader = readable.getReader({ mode: 'byob' })
-    try {
-        let r = await reader.readAtLeast(1 + 16 + 1, get_buffer(1024))
-        let rlen = 0
-        let cache = r.value
-        rlen += r.value.length
-        const version = cache[0]
-        const id = cache.slice(1, 17)
-        const uuid = parse_uuid(uuid_str)
-        if (!validate_uuid(id, uuid)) {
-            reader.releaseLock();
-            return null;
-        }
-        const pb_len = cache[17]
-        const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1
-        if (addr_plus1 + 1 > rlen) {
-            if (r.done) {
-                reader.releaseLock();
-                return null;
-            }
-            r = await reader.readAtLeast(addr_plus1 + 1 - rlen, get_buffer(1024))
-            rlen += r.value.length
-            cache = concat_typed_arrays(cache, r.value)
-        }
-        const cmd = cache[1 + 16 + 1 + pb_len]
-        if (cmd !== 1) {
-            reader.releaseLock();
-            return null;
-        }
-        const port = (cache[addr_plus1 - 3] << 8) + cache[addr_plus1 - 2]
-        const atype = cache[addr_plus1 - 1]
-        let header_len = -1
-        if (atype === ADDRESS_TYPE_IPV4) header_len = addr_plus1 + 4
-        else if (atype === ADDRESS_TYPE_IPV6) header_len = addr_plus1 + 16
-        else if (atype === ADDRESS_TYPE_URL) header_len = addr_plus1 + 1 + cache[addr_plus1]
-        if (header_len < 0) {
-            reader.releaseLock();
-            return null;
-        }
-        if (header_len > rlen) {
-            r = await reader.readAtLeast(header_len - rlen, get_buffer(1024))
-            rlen += r.value.length
-            cache = concat_typed_arrays(cache, r.value)
-        }
-        let hostname = ''
-        const idx = addr_plus1
-        if (atype === ADDRESS_TYPE_IPV4) hostname = cache.slice(idx, idx + 4).join('.')
-        else if (atype === ADDRESS_TYPE_URL) hostname = new TextDecoder().decode(cache.slice(idx + 1, idx + 1 + cache[idx]))
-        else if (atype === ADDRESS_TYPE_IPV6) hostname = cache.slice(idx, idx + 16).reduce((s, b2, i2, a) => i2 % 2 ? s.concat(((a[i2 - 1] << 8) + b2).toString(16)) : s, []).join(':')
-        if (!hostname) {
-            reader.releaseLock();
-            return null;
-        }
-        const data = cache.slice(header_len)
-        return { hostname, port, data, resp: new Uint8Array([version, 0]), reader, done: r.done }
-    } catch (e) {
-        try { reader.releaseLock() } catch (_) { }
-        throw e
-    }
-}
-class Counter {
-    #total;
-    constructor() { this.#total = 0 }
-    get() { return this.#total }
-    add(size) { this.#total += size }
+function parseProxyAddress(serverStr) {
+	if (!serverStr) return null;
+	serverStr = serverStr.trim();
+	if (/^socks5?:\/\//.test(serverStr)) {
+		try {
+			const url = new URL(serverStr.replace(/^socks:\/\//, 'socks5://'));
+			return { type: 'socks5', host: url.hostname, port: parseInt(url.port) || 1080, username: url.username ? decodeURIComponent(url.username) : '', password: url.password ? decodeURIComponent(url.password) : '' };
+		} catch (_) { return null; }
+	}
+	if (/^https?:\/\//.test(serverStr)) {
+		try {
+			const url = new URL(serverStr);
+			return { type: 'http', host: url.hostname, port: parseInt(url.port) || (serverStr.startsWith('https') ? 443 : 80), username: url.username ? decodeURIComponent(url.username) : '', password: url.password ? decodeURIComponent(url.password) : '' };
+		} catch (_) { return null; }
+	}
+	if (serverStr.startsWith('[')) {
+		const idx = serverStr.indexOf(']');
+		if (idx > 0) {
+			const host = serverStr.substring(1, idx);
+			const rest = serverStr.substring(idx + 1);
+			if (rest.startsWith(':')) { const p = parseInt(rest.substring(1), 10); if (!isNaN(p) && p >= 1 && p <= 65535) return { type: 'direct', host, port: p }; }
+			return { type: 'direct', host, port: 443 };
+		}
+	}
+	const lastColon = serverStr.lastIndexOf(':');
+	if (lastColon > 0) {
+		const host = serverStr.substring(0, lastColon);
+		const port = parseInt(serverStr.substring(lastColon + 1), 10);
+		if (!isNaN(port) && port >= 1 && port <= 65535) return { type: 'direct', host, port };
+	}
+	return { type: 'direct', host: serverStr, port: 443 };
 }
 
-async function upload_to_remote(counter, writer, httpx) {
-    const writeStreamRef = new WeakRef(writer);
-    activeStreams.set(writer, { type: 'upload', timestamp: Date.now() });
-    
-    async function inner(d) { 
-        if (!d || d.length === 0) return; 
-        counter.add(d.length); 
-        await writer.write(d); 
-    }
-    
-    try {
-        await inner(httpx.data)
-        while (!httpx.done) {
-            const r = await httpx.reader.read(get_buffer(16 * 1024))
-            if (r.done) break
-            await inner(r.value)
-            httpx.done = r.done
-        }
-    } catch (e) {
-        console.error('Upload error:', e.message);
-        throw e;
-    } finally {
-        try { 
-            httpx.reader.releaseLock(); 
-        } catch (_) { 
-            // ignore error
-        }
-        
-        try {
-            const stream = writeStreamRef.deref();
-            if (stream) {
-                activeStreams.delete(stream);
-            }
-        } catch (_) {
-            // ignore error
-        }
-    }
+function isSpeedTestDomain(hostname) {
+	if (!hostname) return false;
+	const h = hostname.toLowerCase();
+	return ['speedtest.net','fast.com','speedtest.cn','speed.cloudflare.com','ovo.speedtestcustom.com'].some(d => h === d || h.endsWith('.' + d));
 }
 
-function create_uploader(httpx, writable) {
-    const counter = new Counter()
-    const writer = writable.getWriter()
-    const done = (async () => {
-        try {
-            await upload_to_remote(counter, writer, httpx)
-        } catch (e) {
-            try { writer.abort() } catch (_) { }
-            throw e;
-        } finally {
-            try { await writer.close() } catch (_) { }
-        }
-    })()
-    return { counter, done, abort: () => { try { writer.abort() } catch (_) { } } }
+// ---------------------- 连接辅助 ----------------------
+
+async function connectDirect(address, port, initialData) {
+	const sock = connect({ hostname: address, port });
+	const writer = sock.writable.getWriter();
+	await writer.write(initialData);
+	writer.releaseLock();
+	return sock;
 }
 
-function create_downloader(resp, remote_readable) {
-    const counter = new Counter()
-    let stream
-    const done = new Promise((resolve, reject) => {
-        stream = new TransformStream({
-            start(c) { counter.add(resp.length); c.enqueue(resp) },
-            transform(chunk, c) { counter.add(chunk.length); c.enqueue(chunk) },
-            cancel(reason) { reject(reason) }
-        }, null, new ByteLengthQueuingStrategy({ highWaterMark: BUFFER_SIZE }))
-
-        const reader = remote_readable.getReader()
-        const writer = stream.writable.getWriter()
-        activeStreams.set(reader, { type: 'download_reader', timestamp: Date.now() });
-        activeStreams.set(writer, { type: 'download_writer', timestamp: Date.now() });
-
-        ; (async () => {
-            try {
-                while (true) {
-                    const r = await reader.read()
-                    if (r.done) break
-                    await writer.write(r.value)
-                }
-                await writer.close()
-                resolve()
-            } catch (e) {
-                reject(e)
-            } finally {
-                try { reader.releaseLock() } catch (_) {}
-                try { writer.releaseLock() } catch (_) {}
-                
-                try {
-                    activeStreams.delete(reader);
-                    activeStreams.delete(writer);
-                } catch (_) {
-                    // ignore error
-                }
-            }
-        })()
-    })
-    return {
-        readable: stream.readable,
-        counter,
-        done,
-        abort: () => {
-            try { stream.readable.cancel() } catch (_) { }
-            try { stream.writable.abort() } catch (_) { }
-        }
-    }
+async function connectViaSocks5(proxyCfg, targetHost, targetPort, initialData) {
+	const { host, port, username, password } = proxyCfg;
+	const socket = connect({ hostname: host, port });
+	const writer = socket.writable.getWriter();
+	const reader = socket.readable.getReader();
+	try {
+		const hasAuth = !!(username && password);
+		const authMethods = new Uint8Array(hasAuth ? 4 : 3);
+		authMethods[0] = 5; authMethods[1] = hasAuth ? 2 : 1; authMethods[2] = 0;
+		if (hasAuth) authMethods[3] = 2;
+		await writer.write(authMethods);
+		const methodResp = await reader.read();
+		if (methodResp.done || methodResp.value.byteLength < 2) throw new Error('SOCKS5 method select failed');
+		const method = new Uint8Array(methodResp.value)[1];
+		if (method === 2) {
+			if (!hasAuth) throw new Error('SOCKS5 requires auth');
+			const ub = new TextEncoder().encode(username);
+			const pb = new TextEncoder().encode(password);
+			const ar = new Uint8Array(3 + ub.length + pb.length);
+			ar[0] = 1; ar[1] = ub.length; ar.set(ub, 2); ar[2 + ub.length] = pb.length; ar.set(pb, 3 + ub.length);
+			await writer.write(ar);
+			const aResp = await reader.read();
+			if (aResp.done || new Uint8Array(aResp.value)[1] !== 0) throw new Error('SOCKS5 auth failed');
+		} else if (method !== 0) { throw new Error(`SOCKS5 unsupported auth: ${method}`); }
+		const hb = new TextEncoder().encode(targetHost);
+		const cr = new Uint8Array(7 + hb.length);
+		cr[0] = 5; cr[1] = 1; cr[2] = 0; cr[3] = 3; cr[4] = hb.length; cr.set(hb, 5);
+		new DataView(cr.buffer).setUint16(5 + hb.length, targetPort, false);
+		await writer.write(cr);
+		const cResp = await reader.read();
+		if (cResp.done || new Uint8Array(cResp.value)[1] !== 0) throw new Error('SOCKS5 connect failed');
+		await writer.write(initialData);
+		writer.releaseLock(); reader.releaseLock();
+		return socket;
+	} catch (e) { writer.releaseLock(); reader.releaseLock(); throw e; }
 }
 
-function parseProxyConfig(proxyStr) {
-    if (!proxyStr) return null;
-    proxyStr = proxyStr.trim();
-    if (proxyStr.startsWith('socks://') || proxyStr.startsWith('socks5://')) {
-        const urlStr = proxyStr.replace(/^socks:\/\//, 'socks5://');
-        try {
-            const url = new URL(urlStr);
-            return {
-                type: 'socks5',
-                username: url.username ? decodeURIComponent(url.username) : '',
-                password: url.password ? decodeURIComponent(url.password) : '',
-                host: url.hostname,
-                port: parseInt(url.port) || 1080
-            };
-        } catch (e) {
-            const socksMatch = proxyStr.match(/^socks5?:\/\/(?:([^:]+):([^@]+)@)?([^:]+)(?::(\d+))?$/);
-            if (socksMatch) {
-                return {
-                    type: 'socks5',
-                    username: socksMatch[1] || '',
-                    password: socksMatch[2] || '',
-                    host: socksMatch[3],
-                    port: parseInt(socksMatch[4]) || 1080
-                };
-            }
-            return null;
-        }
-    }
-    if (proxyStr.startsWith('http://') || proxyStr.startsWith('https://')) {
-        try {
-            const url = new URL(proxyStr);
-            return {
-                type: url.protocol === 'https:' ? 'https' : 'http',
-                username: url.username ? decodeURIComponent(url.username) : '',
-                password: url.password ? decodeURIComponent(url.password) : '',
-                host: url.hostname,
-                port: parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80)
-            };
-        } catch (e) {
-            const httpMatch = proxyStr.match(/^(https?):\/\/(?:([^:]+):([^@]+)@)?([^:]+)(?::(\d+))?$/);
-            if (httpMatch) {
-                return {
-                    type: httpMatch[1],
-                    username: httpMatch[2] || '',
-                    password: httpMatch[3] || '',
-                    host: httpMatch[4],
-                    port: parseInt(httpMatch[5]) || (httpMatch[1] === 'https' ? 443 : 80)
-                };
-            }
-            return null;
-        }
-    }
-    const hostMatch = proxyStr.match(/^([^:]+)(?::(\d+))?$/);
-    if (hostMatch) {
-        return {
-            type: 'direct',
-            host: hostMatch[1],
-            port: parseInt(hostMatch[2] || '443')
-        };
-    }
-    return null;
+async function connectViaHttp(proxyCfg, targetHost, targetPort, initialData) {
+	const { host, port, username, password } = proxyCfg;
+	const socket = connect({ hostname: host, port });
+	const writer = socket.writable.getWriter();
+	const reader = socket.readable.getReader();
+	try {
+		const ah = (username && password) ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
+		const req = [`CONNECT ${targetHost}:${targetPort} HTTP/1.1`, `Host: ${targetHost}:${targetPort}`, ah, 'User-Agent: Mozilla/5.0', 'Connection: keep-alive', '', ''].join('\r\n');
+		await writer.write(new TextEncoder().encode(req));
+		let buf = new Uint8Array(0), he = -1;
+		for (let r = 0; r < 8192;) {
+			const { done, value } = await reader.read();
+			if (done) throw new Error('Connection closed');
+			const nb = new Uint8Array(buf.length + value.length); nb.set(buf); nb.set(value, buf.length); buf = nb; r += value.length;
+			for (let i = 0; i < buf.length - 3; i++) { if (buf[i] === 0x0d && buf[i+1] === 0x0a && buf[i+2] === 0x0d && buf[i+3] === 0x0a) { he = i + 4; break; } }
+			if (he > 0) break;
+		}
+		if (he < 0) throw new Error('Invalid HTTP response');
+		const sl = new TextDecoder().decode(buf.slice(0, he)).split('\r\n')[0];
+		const m = sl.match(/HTTP\/\d\.\d\s+(\d+)/);
+		if (!m) throw new Error(`Invalid response: ${sl}`);
+		const code = parseInt(m[1]);
+		if (code < 200 || code >= 300) throw new Error(`Connect failed: ${sl}`);
+		await writer.write(initialData);
+		writer.releaseLock(); reader.releaseLock();
+		return socket;
+	} catch (e) { try { writer.releaseLock(); } catch (_) {} try { reader.releaseLock(); } catch (_) {} try { socket.close(); } catch (_) {} throw e; }
 }
 
-async function socks5Connect(remote, targetHost, targetPort, username, password) {
-    let writer, reader;
-    try {
-        writer = remote.writable.getWriter();
-        const hasAuth = username && password;
-        const authMethods = hasAuth ? 
-            new Uint8Array([0x05, 0x02, 0x00, 0x02]) :
-            new Uint8Array([0x05, 0x01, 0x00]); 
-        
-        await writer.write(authMethods);
-        writer.releaseLock();
-        
-        reader = remote.readable.getReader();
-        const authResponse = await reader.read();
-        if (authResponse.done || authResponse.value.byteLength < 2) {
-            throw new Error('S5 method selection failed');
-        }
-        
-        const selectedMethod = new Uint8Array(authResponse.value)[1];
-        reader.releaseLock();
-        
-        if (selectedMethod === 0x02) {
-            if (!username || !password) {
-                throw new Error('S5 requires authentication');
-            }
-            const writer2 = remote.writable.getWriter();
-            const userBytes = new TextEncoder().encode(username);
-            const passBytes = new TextEncoder().encode(password);
-            const authPacket = new Uint8Array(3 + userBytes.length + passBytes.length);
-            authPacket[0] = 0x01; 
-            authPacket[1] = userBytes.length;
-            authPacket.set(userBytes, 2);
-            authPacket[2 + userBytes.length] = passBytes.length;
-            authPacket.set(passBytes, 3 + userBytes.length);
-            await writer2.write(authPacket);
-            writer2.releaseLock();
-            
-            const reader2 = remote.readable.getReader();
-            const authResponse2 = await reader2.read();
-            if (authResponse2.done || new Uint8Array(authResponse2.value)[1] !== 0x00) {
-                throw new Error('S5 authentication failed');
-            }
-            reader2.releaseLock();
-        } else if (selectedMethod !== 0x00) {
-            throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
-        }
-        
-        const writer3 = remote.writable.getWriter();
-        const hostBytes = new TextEncoder().encode(targetHost);
-        const connectPacket = new Uint8Array(7 + hostBytes.length);
-        connectPacket[0] = 0x05;
-        connectPacket[1] = 0x01;
-        connectPacket[2] = 0x00; 
-        connectPacket[3] = 0x03; 
-        connectPacket[4] = hostBytes.length;
-        connectPacket.set(hostBytes, 5);
-        new DataView(connectPacket.buffer).setUint16(5 + hostBytes.length, targetPort, false);
-        await writer3.write(connectPacket);
-        writer3.releaseLock();
-        
-        const reader3 = remote.readable.getReader();
-        const connectResponse = await reader3.read();
-        if (connectResponse.done || new Uint8Array(connectResponse.value)[1] !== 0x00) {
-            throw new Error('S5 connection failed');
-        }
-        reader3.releaseLock();
-        return true;
-    } catch (e) {
-        try { if (writer) writer.releaseLock(); } catch (_) {}
-        try { if (reader) reader.releaseLock(); } catch (_) {}
-        throw new Error(`s5 error: ${e.message}`);
-    }
+// ---------------------- 流转发 ----------------------
+
+function createWebSocketStream(socket, earlyDataHeader) {
+	let cancelled = false;
+	return new ReadableStream({
+		start(controller) {
+			socket.addEventListener('message', async (event) => {
+				if (cancelled) return;
+				let data = event.data;
+				if (data instanceof Blob) data = await data.arrayBuffer();
+				controller.enqueue(data);
+			});
+			socket.addEventListener('close', () => { if (!cancelled) { closeSocketQuietly(socket); controller.close(); } });
+			socket.addEventListener('error', (err) => controller.error(err));
+			const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+			if (error) Promise.resolve().then(() => controller.error(error));
+			else if (earlyData) Promise.resolve().then(() => { if (!cancelled) controller.enqueue(earlyData); });
+		},
+		cancel() { cancelled = true; closeSocketQuietly(socket); },
+	});
 }
 
-async function httpConnect(remote, targetHost, targetPort, username, password) {
-    let writer, reader;
-    try {
-        writer = remote.writable.getWriter();
-        let connectRequest = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`;
-        connectRequest += `Host: ${targetHost}:${targetPort}\r\n`;
-        if (username && password) {
-            const auth = btoa(`${username}:${password}`);
-            connectRequest += `Proxy-Authorization: Basic ${auth}\r\n`;
-        }
-        connectRequest += '\r\n';
-        await writer.write(new TextEncoder().encode(connectRequest));
-        writer.releaseLock();
-        reader = remote.readable.getReader();
-        let responseData = new Uint8Array(0);
-        let headerComplete = false;
-        const readTimeout = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('HTTP read timeout')), CONNECT_TIMEOUT_MS)
-        );
-        
-        while (!headerComplete) {
-            const chunk = await Promise.race([
-                reader.read(),
-                readTimeout
-            ]);
-            
-            if (chunk.done) {
-                throw new Error('HTTP connection closed unexpectedly');
-            }
-            
-            const newData = new Uint8Array(responseData.length + chunk.value.byteLength);
-            newData.set(responseData);
-            newData.set(new Uint8Array(chunk.value), responseData.length);
-            responseData = newData;
-            
-            const responseText = new TextDecoder().decode(responseData);
-            if (responseText.includes('\r\n\r\n')) {
-                headerComplete = true;
-            }
-        }
-        reader.releaseLock();
-        
-        const responseText = new TextDecoder().decode(responseData);
-        if (!responseText.startsWith('HTTP/1.1 200') && !responseText.startsWith('HTTP/1.0 200')) {
-            throw new Error(`HTTP connection failed: ${responseText.split('\r\n')[0]}`);
-        }
-        return true;
-    } catch (e) {
-        try { if (writer) writer.releaseLock(); } catch (_) {}
-        try { if (reader) reader.releaseLock(); } catch (_) {}
-        throw new Error(`HTTP connection failed: ${e.message}`);
-    }
+function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
+	let header = headerData, hasData = false;
+	remoteSocket.readable.pipeTo(new WritableStream({
+		async write(chunk) {
+			hasData = true;
+			if (webSocket.readyState !== WS_OPEN) throw new Error('WebSocket not open');
+			if (header) { const resp = new Uint8Array(header.length + chunk.byteLength); resp.set(header, 0); resp.set(chunk, header.length); webSocket.send(resp.buffer); header = null; }
+			else { webSocket.send(chunk); }
+		},
+		abort() {},
+	})).catch(() => { closeSocketQuietly(webSocket); });
+	if (!hasData && retryFunc) retryFunc();
 }
 
-async function connect_to_remote(httpx, proxyIP, fallbackProxyIP) {
-    const proxyConfig = parseProxyConfig(proxyIP);
-    
-    if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https')) {
-        let remote = null;
-        try {
-            remote = connect({ hostname: proxyConfig.host, port: proxyConfig.port });
-            activeConnections.set(remote, { 
-                type: proxyConfig.type, 
-                host: proxyConfig.host, 
-                port: proxyConfig.port,
-                timestamp: Date.now() 
-            });
-        
-            await Promise.race([
-                remote.opened,
-                new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error(`connet ${proxyConfig.host}:${proxyConfig.port} timeout`)), CONNECT_TIMEOUT_MS)
-                )
-            ]);
-            
-            if (proxyConfig.type === 'socks5') {
-                await socks5Connect(remote, httpx.hostname, httpx.port, proxyConfig.username, proxyConfig.password);
-            } else {
-                await httpConnect(remote, httpx.hostname, httpx.port, proxyConfig.username, proxyConfig.password);
-            }
-            
-            const uploader = create_uploader(httpx, remote.writable);
-            const downloader = create_downloader(httpx.resp, remote.readable);
-            return {
-                downloader,
-                uploader,
-                close: () => { 
-                    try { 
-                        activeConnections.delete(remote);
-                        remote.close(); 
-                    } catch (_) { 
-                        // ignore error
-                    } 
-                }
-            };
-        } catch (e) {
-            if (remote) {
-                try { 
-                    activeConnections.delete(remote);
-                    remote.close(); 
-                } catch (_) { 
-                    // ignore error
-                }
-            }
-            console.error(`${proxyConfig.type.toUpperCase()} connet failed:`, e.message);
-            return null;
-        }
-    }
-    
-    const connectionTargets = [
-        { type: "direct", host: httpx.hostname, port: httpx.port },
-        { type: "proxy", host: proxyConfig ? proxyConfig.host : proxyIP, port: proxyConfig ? proxyConfig.port : httpx.port },
-        { type: "fallback", host: fallbackProxyIP, port: httpx.port }
-    ].filter(target => target.host);
-
-    const connectionPromises = connectionTargets.map(({ type, host, port }) =>
-        (async () => {
-            let remote = null;
-            for (let attempt = 0; attempt < MAX_RETRIES + 1; attempt++) {
-                try {
-                    remote = connect({ hostname: host, port: port });
-                    activeConnections.set(remote, { 
-                        type, 
-                        host, 
-                        port,
-                        timestamp: Date.now(),
-                        attempt
-                    });
-                
-                    await Promise.race([
-                        remote.opened,
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error(` ${host} timeout`)), CONNECT_TIMEOUT_MS)
-                        )
-                    ]);
-                    return { remote, host, type };
-                } catch (error) {
-                    if (remote) {
-                        try { 
-                            activeConnections.delete(remote);
-                            remote.close(); 
-                        } catch (_) { 
-                            // ignore error
-                        }
-                    }
-                    
-                    if (attempt < MAX_RETRIES) {
-                        await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-                        continue;
-                    }
-                    throw error;
-                }
-            }
-        })()
-    );
-
-    let successfulConnection = null;
-    const results = await Promise.allSettled(connectionPromises);
-    
-    for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) {
-            successfulConnection = result.value;
-            break;
-        }
-    }
-
-    if (successfulConnection) {
-        const { remote } = successfulConnection;
-        const uploader = create_uploader(httpx, remote.writable);
-        const downloader = create_downloader(httpx.resp, remote.readable);
-        return {
-            downloader,
-            uploader,
-            close: () => { 
-                try { 
-                    activeConnections.delete(remote);
-                    remote.close(); 
-                } catch (_) { 
-                    // ignore error
-                } 
-            }
-        };
-    } else {
-        return null;
-    }
+async function forwardTCP(host, port, rawData, ws, respHeader, remoteWrapper, customProxyIP) {
+	let proxyConfig = null, shouldUseProxy = false;
+	if (customProxyIP) {
+		proxyConfig = parseProxyAddress(customProxyIP);
+		if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http')) shouldUseProxy = true;
+		else if (!proxyConfig) proxyConfig = parseProxyAddress(CONFIG.proxyIP || DEFAULT_PROXY_IP) || { type: 'direct', host: DEFAULT_PROXY_IP, port: 443 };
+	} else {
+		proxyConfig = parseProxyAddress(CONFIG.proxyIP || DEFAULT_PROXY_IP) || { type: 'direct', host: DEFAULT_PROXY_IP, port: 443 };
+		if (proxyConfig.type === 'socks5' || proxyConfig.type === 'http') shouldUseProxy = true;
+	}
+	async function viaProxy() {
+		let ns;
+		if (proxyConfig.type === 'socks5') ns = await connectViaSocks5(proxyConfig, host, port, rawData);
+		else if (proxyConfig.type === 'http') ns = await connectViaHttp(proxyConfig, host, port, rawData);
+		else ns = await connectDirect(proxyConfig.host, proxyConfig.port, rawData);
+		remoteWrapper.socket = ns;
+		ns.closed?.catch(() => {}).finally(() => closeSocketQuietly(ws));
+		connectStreams(ns, ws, respHeader, null);
+	}
+	if (shouldUseProxy) { await viaProxy(); }
+	else {
+		try { const s = await connectDirect(host, port, rawData); remoteWrapper.socket = s; connectStreams(s, ws, respHeader, viaProxy); }
+		catch (_) { await viaProxy(); }
+	}
 }
 
-async function handle_client(body, cfg) {
-    if (ACTIVE_CONNECTIONS >= MAX_CONCURRENT) {
-        return new Response('Too many connections', { status: 429 });
-    }
-    
-    ACTIVE_CONNECTIONS++;
-    let cleaned = false;
-    
-    const cleanup = () => {
-        if (!cleaned) {
-            ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-            cleaned = true;
-        }
-    };
-
-    try {
-        const httpx = await read_header(body, cfg.UUID);
-        if (!httpx) {
-            cleanup();
-            return null;
-        }
-        
-        const remoteConnection = await connect_to_remote(httpx, cfg.PROXYIP, '13.230.34.30');
-        if (!remoteConnection) {
-            cleanup();
-            return null;
-        }
-
-        const connectionClosed = Promise.race([
-            remoteConnection.downloader.done.catch(() => { }),
-            remoteConnection.uploader.done.catch(() => { }),
-            new Promise(resolve => setTimeout(resolve, IDLE_TIMEOUT_MS))
-        ]).finally(() => {
-            try { remoteConnection.close(); } catch (_) { }
-            try { remoteConnection.downloader.abort(); } catch (_) { }
-            try { remoteConnection.uploader.abort(); } catch (_) { }
-            cleanup();
-        });
-
-        return { 
-            readable: remoteConnection.downloader.readable, 
-            closed: connectionClosed 
-        };
-    } catch (e) {
-        console.error('Client handling error:', e.message);
-        cleanup();
-        return null;
-    }
-}
-
-async function handle_post(request, cfg) {
-    try {
-        return await handle_client(request.body, cfg);
-    } catch (e) {
-        console.error('POST handling error:', e.message);
-        return null;
-    }
-}
-
-function generate_link(uuid, hostname, port, path, sni, currentHost, proxyIP = null) {
-    const protc = 'x'+'h'+'t'+'t'+'p', header = 'v'+'l'+'e'+'s'+'s';
-    const params = new URLSearchParams({
-        encryption: 'none', security: 'tls', sni: sni || currentHost, fp: 'chrome', allowInsecure: '0', alpn: 'h2,http/1.1',
-        type: protc, host: currentHost, path: path.startsWith('/') ? path : `/${path}`, mode: 'stream-one'
-    })
-    
-    if (proxyIP) {
-        params.append('proxyip', proxyIP);
-    }
-    
-    return `${header}://${uuid}@${hostname}:${port}?${params.toString()}#${header}-${protc}`
-}
-
-function generate_subscription(uuid, cfipList, port = 443, path, sni, currentHost, proxyIP = null) {
-    return btoa(cfipList.map(h => generate_link(uuid, h, port, path, sni, currentHost, proxyIP)).join('\n'))
-}
+// ---------------------- 协议处理 ----------------------
 
 export default {
-    async fetch(request) {
-        const url = new URL(request.url)
-        let customProxyIP = proxyIP;
-        let pathProxyIP = null;
-        let pathname = url.pathname;
-        if (pathname.startsWith('/proxyip=')) {
-            try { pathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
-            } catch (e) { }
-        }
-        customProxyIP = pathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip') || proxyIP;
-        const cfg = { UUID: yourUUID, PROXYIP: customProxyIP }
-        if (request.method === 'POST') {
-            const r = await handle_post(request, cfg)
-            if (r) return new Response(r.readable, {
-                headers: {
-                    'X-Accel-Buffering': 'no',
-                    'Cache-Control': 'no-store',
-                    Connection: 'keep-alive',
-                    'User-Agent': 'Go-http-client/2.0',
-                    'Content-Type': 'application/grpc'
-                }
-            })
-            return new Response('Internal Server Error', { status: 500 })
-        }
-        if (request.method === 'GET') {
-            const path = url.pathname
-            if (path === '/') {
-                return new Response(
-                    `<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VLESS XHTTP</title><style>body{font-family:Arial,sans-serif;background:linear-gradient(135deg, #85dfb5 0%, #136e92 100%);min-height:100vh;display:flex;align-items:center;justify-content:center}.container{max-width:600px;background:#fff;padding:40px;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.3);text-align:center}h1{color:#667eea;margin-bottom:20px}.info{font-size:18px;color:#666;margin:20px 0}.link{display:inline-block;background:#667eea;color:#fff;padding:12px 30px;border-radius:5px;text-decoration:none;margin-top:20px}.link:hover{background:#5568d3}.footer{margin-top:30px;padding-top:20px;border-top:1px solid #eee;font-size:14px;color:#999}.footer a{color:#667eea;text-decoration:none;margin:0 10px}.footer a:hover{text-decoration:underline}</style></head><body><div class="container"><h2>VLESS-XHTTP 代理服务</h2><div class="info">请访问: <strong>https://${url.hostname}/你的UUID</strong><br><br><p>查看节点订阅链接</p><div class="footer"><a href="https://github.com/eooce/CF-Workers-and-Snip-VLESS" target="_blank">GitHub 项目</a>|<a href="https://t.me/eooceu" target="_blank">Telegram 群组</a>|<a href="https://check-proxyip.ssss.nyc.mn" target="_blank">ProxyIP 检测服务</a></div></div></body></html>`,
-                    { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-                );
-            }
-            if (path.includes(cfg.UUID) && path.toLowerCase() !== `/sub/${yourUUID}`) {
-                return new Response(
-                    `<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VLESS XHTTP</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Arial,sans-serif;background:linear-gradient(135deg, #85dfb5 0%, #136e92 100%);min-height:100vh;padding:20px}.container{max-width:900px;margin:0 auto;background:#fff;border-radius:15px;padding:30px;box-shadow:0 20px 60px rgba(0,0,0,.3)}h1{color:#667eea;margin-bottom:10px;font-size:2rem;text-align:center}.section{margin-bottom:25px}.section-title{color:#667eea;font-size:16px;font-weight:600;margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid #667eea}.link-box{background:#f7f9fc;border:1px solid #e1e8ed;border-radius:8px;padding:12px;margin-bottom:10px}.link-label{font-size:16px;color:#666;margin-bottom:6px;font-weight:700}.link-content{display:flex;gap:8px}.link-text{flex:1;background:#fff;padding:8px 12px;border-radius:5px;border:1px solid #ddd;font-size:.8rem;word-break:break-all;font-family:monospace}.copy-btn{background:#667eea;color:#fff;border:none;padding:8px 16px;border-radius:5px;cursor:pointer;font-size:13px;white-space:nowrap}.copy-btn:hover{background:#5568d3}.copy-btn.copied{background:#48c774}.usage-section{background:#fff9e6;border-left:4px solid #ffc107;padding:15px;border-radius:5px;margin-top:25px}.usage-title{color:#f57c00;font-size:1.2rem;font-weight:600;margin-bottom:12px}.usage-item{margin-bottom:12px;font-size:13px;line-height:1.6}.usage-item strong{color:#333;display:block;margin-bottom:4px}.usage-item code{background:#fff;padding:2px 6px;border-radius:3px;color:#e91e63;font-size:13px;border:1px solid #ddd;word-wrap:break-word;word-break:break-all;display:inline-block;max-width:100%}.example{color:#666;font-size:14px;margin-left:8px}.footer{margin-top:30px;padding-top:20px;border-top:1px solid #e1e8ed;text-align:center;font-size:14px;color:#999}.footer a{color:#667eea;text-decoration:none;margin:0 10px}.footer a:hover{text-decoration:underline}@media (max-width:768px){.container{padding:20px}.link-content{flex-direction:column}.copy-btn{width:100%}}</style></head><body><div class="container"><h1>VLESS-XHTTP 订阅中心</h1><br><div class="section"><div class="section-title">🔗 通用订阅</div><div class="link-box"><div class="link-label">v2rayN / Loon / Shadowrocket / Karing</div><div class="link-content"><div class="link-text" id="v2ray-link">https://${url.hostname}/sub/${yourUUID}</div><button class="copy-btn" onclick="copyToClipboard('v2ray-link',this)">复制</button></div></div></div><div class="usage-section"><div class="usage-title">⚙️ 自定义路径(节点里的path)使用说明</div><div class="usage-item"><strong>1. 默认路径</strong><code>/</code><div class="example">使用代码里设置的默认proxyip</div></div><div class="usage-item"><strong>2. 带端口的proxyip</strong><code>/proxyip=210.61.97.241:81</code><br><code>/proxyip=proxy.xxxxxxxx.tk:50001</code></div><div class="usage-item"><strong>3. 域名proxyip</strong><code>/proxyip=jp.yutian.nyc.mn</code></div><div class="usage-item"><strong>4. 全局SOCKS5</strong><code>/proxyip=socks://user:password@host:port</code><br><code>/proxyip=socks5://user:password@host:port</code></div><div class="usage-item"><strong>5. 全局HTTP/HTTPS</strong><code>/proxyip=http://user:password@host:port</code><br><code>/proxyip=https://user:password@host:port</code></div></div><div class="footer"><a href="https://github.com/eooce/CF-Workers-and-Snip-VLESS" target="_blank">GitHub 项目</a>|<a href="https://t.me/eooceu" target="_blank">Telegram 群组</a>|<a href="https://check-proxyip.ssss.nyc.mn" target="_blank">ProxyIP 检测服务</a></div></div><script>function copyToClipboard(e,t){const n=document.getElementById(e).textContent;navigator.clipboard&&navigator.clipboard.writeText?navigator.clipboard.writeText(n).then(()=>{showCopySuccess(t)}).catch(()=>{fallbackCopy(n,t)}):fallbackCopy(n,t)}function fallbackCopy(e,t){const n=document.createElement("textarea");n.value=e,n.style.position="fixed",n.style.left="-999999px",document.body.appendChild(n),n.select();try{document.execCommand("copy"),showCopySuccess(t)}catch(e){alert("复制失败，请手动复制")}document.body.removeChild(n)}function showCopySuccess(e){const t=e.textContent;e.textContent="已复制",e.classList.add("copied"),setTimeout(()=>{e.textContent=t,e.classList.remove("copied")},2e3)}</script></body></html>`,
-                    { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-                );
-            }
-            if (path.toLowerCase() === `/sub/${yourUUID}`) {
-                const port = 443,
-                    nodePath = '/',
-                    sni = url.searchParams.get('sni') || url.hostname,
-                    currentHost = url.hostname
-                const subscription = generate_subscription(cfg.UUID, cfip, port, nodePath, sni, currentHost, cfg.PROXYIP)
-                return new Response(subscription, {
-                    headers: {
-                        'Content-Type': 'text/plain; charset=utf-8',
-                        'Cache-Control': 'no-cache, no-store, must-revalidate',
-                        'Pragma': 'no-cache',
-                        'Expires': '0'
-                    }
-                })
-            }
-        }
-        return new Response('Method Not Allowed', { status: 405 })
-    }
+	async fetch(request, env, ctx) {
+		// 加载环境变量
+		if (env.PROXYIP || env.proxyip || env.proxyIP) {
+			const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
+			CONFIG.proxyIP = servers[0];
+		}
+		CONFIG.password = env.PASSWORD || env.PASSWD || env.password || CONFIG.password;
+		CONFIG.subPath = env.SUB_PATH || env.subpath || CONFIG.subPath;
+		CONFIG.uuid = env.UUID || env.uuid || CONFIG.uuid;
+		if (CONFIG.subPath === 'link' || CONFIG.subPath === '') CONFIG.subPath = CONFIG.uuid;
+
+		const url = new URL(request.url);
+		const pathname = url.pathname;
+
+		if (pathname.startsWith('/proxyip=')) {
+			const pp = decodeURIComponent(pathname.substring(9)).trim();
+			if (pp && !request.headers.get('Upgrade')) {
+				CONFIG.proxyIP = pp;
+				return new Response(`proxyIP set to: ${pp}`, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+			}
+		}
+
+		if (request.headers.get('Upgrade') === 'websocket') {
+			const cpi = pathname.startsWith('/proxyip=') ? decodeURIComponent(pathname.substring(9)).trim() : url.searchParams.get('proxyip') || request.headers.get('proxyip');
+			return handleSSRequest(request, cpi);
+		}
+
+		if (request.method === 'GET') {
+			if (pathname === '/') return serveHomePage(request);
+			const sp = CONFIG.ssPath || CONFIG.uuid;
+			if (url.pathname.toLowerCase().includes(`/${sp.toLowerCase()}`)) return generateSubscription(url);
+		}
+
+		return new Response('Not Found', { status: 404 });
+	},
+};
+
+async function handleSSRequest(request, customProxyIP) {
+	const pair = new WebSocketPair();
+	const [clientSock, serverSock] = [pair[0], pair[1]];
+	serverSock.accept();
+	serverSock.binaryType = 'arraybuffer';
+	const remoteWrapper = { socket: null };
+	const earlyData = request.headers.get('sec-websocket-protocol') || '';
+	const readable = createWebSocketStream(serverSock, earlyData);
+
+	readable.pipeTo(new WritableStream({
+		async write(chunk) {
+			if (remoteWrapper.socket) {
+				const w = remoteWrapper.socket.writable.getWriter();
+				await w.write(chunk); w.releaseLock();
+				return;
+			}
+			if (chunk.byteLength < 4) throw new Error('Invalid packet size');
+			const method = new Uint8Array(chunk.slice(0, 1))[0];
+			const v = new Uint8Array(chunk.slice(1, 2))[0];
+			if (v !== 1) throw new Error(`Invalid version: ${v}`);
+			if (method !== 0 && method !== 1 && method !== 2 && method !== 3 && method !== 4 && method !== 5 && method !== 6 && method !== 7 && method !== 8 && method !== 9 && method !== 10 && method !== 11 && method !== 12 && method !== 13 && method !== 14 && method !== 15) throw new Error(`Invalid method: ${method}`);
+			const addrIdx = 2;
+			const atype = new Uint8Array(chunk.slice(addrIdx, addrIdx + 1))[0];
+			let hostname = '', addrLen = 0;
+			switch (atype) {
+				case 1: hostname = [...new Uint8Array(chunk.slice(addrIdx + 1, addrIdx + 5))].join('.'); addrLen = 4; break;
+				case 3: addrLen = new Uint8Array(chunk.slice(addrIdx + 1, addrIdx + 2))[0]; hostname = new TextDecoder().decode(chunk.slice(addrIdx + 2, addrIdx + 2 + addrLen)); break;
+				case 4: { const parts = []; const dv = new DataView(chunk.slice(addrIdx + 1, addrIdx + 17)); for (let i = 0; i < 8; i++) parts.push(dv.getUint16(i * 2).toString(16)); hostname = parts.join(':'); addrLen = 16; break; }
+				default: throw new Error(`Invalid address type: ${atype}`);
+			}
+			const port = new DataView(chunk.slice(addrIdx + 1 + addrLen, addrIdx + 1 + addrLen + 2)).getUint16(0);
+			if (isSpeedTestDomain(hostname)) throw new Error('Speedtest blocked');
+			const rawData = chunk.slice(addrIdx + 1 + addrLen + 2);
+			await forwardTCP(hostname, port, rawData, serverSock, null, remoteWrapper, customProxyIP);
+		},
+	})).catch(() => {});
+
+	return new Response(null, { status: 101, webSocket: clientSock });
+}
+
+// ---------------------- 页面服务 ----------------------
+
+function serveHomePage(request) {
+	const host = request.headers.get('Host') || '';
+	const baseUrl = `https://${host}`;
+	const urlObj = new URL(request.url);
+	const providedPassword = urlObj.searchParams.get('password');
+	if (providedPassword) {
+		if (providedPassword === CONFIG.password) return renderMainPage(host, baseUrl);
+		return renderLoginPage(host, baseUrl, true);
+	}
+	return renderLoginPage(host, baseUrl, false);
+}
+
+function renderLoginPage(host, baseUrl, showError) {
+	const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Shadowsocks - Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#7dd3ca,#a17ec4);height:100vh;display:flex;align-items:center;justify-content:center;color:#333;overflow:hidden}.login-container{background:rgba(255,255,255,.95);backdrop-filter:blur(10px);border-radius:20px;padding:40px;box-shadow:0 20px 40px rgba(0,0,0,.1);max-width:400px;width:95%;text-align:center}.logo{margin-bottom:-20px;font-size:2.5rem}.title{font-size:1.8rem;margin-bottom:8px;color:#2d3748}.subtitle{color:#718096;margin-bottom:30px}.form-group{margin-bottom:20px;text-align:left}.form-label{display:block;margin-bottom:8px;font-weight:600;color:#4a5568}.form-input{width:100%;padding:12px 16px;border:2px solid #e2e8f0;border-radius:8px;font-size:1rem;transition:border-color .3s}.form-input:focus{outline:none;border-color:#667eea;box-shadow:0 0 0 3px rgba(102,126,234,.1)}.btn-login{width:100%;padding:12px;background:linear-gradient(135deg,#12cd9e,#a881d0);color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;transition:all .3s}.btn-login:hover{transform:translateY(-2px);box-shadow:0 10px 20px rgba(0,0,0,.1)}.error-message{background:#fed7d7;color:#c53030;padding:12px;border-radius:8px;margin-bottom:20px;border-left:4px solid #e53e3e}.footer{margin-top:20px;color:#718096;font-size:.9rem}@media(max-width:480px){.login-container{padding:30px 20px}.title{font-size:1.5rem}}</style></head><body><div class="login-container"><div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div><h1 class="title">Shadowsocks Service</h1><p class="subtitle">请输入密码以访问服务</p>${showError ? '<div class="error-message">密码错误，请重试</div>' : ''}<form onsubmit="handleLogin(event)"><div class="form-group"><input type="password" id="password" class="form-input" placeholder="请输入密码" required autofocus></div><button type="submit" class="btn-login">登录</button></form><div class="footer"><p>Powered by Cloudflare Workers</p></div></div><script>function handleLogin(e){e.preventDefault();const p=document.getElementById('password').value;const u=new URL(location.href);u.searchParams.set('password',p);location.href=u.toString()}</script></body></html>`;
+	return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-cache, no-store, must-revalidate' } });
+}
+
+function renderMainPage(host, baseUrl) {
+	const subUrl = `${baseUrl}/${CONFIG.ssPath || CONFIG.uuid}`;
+	const clashUrl = `https://sublink.eooce.com/clash?config=${subUrl}`;
+	const singboxUrl = `https://sublink.eooce.com/singbox?config=${subUrl}`;
+	const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Shadowsocks Service</title><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#66ead7,#9461c8);height:100vh;display:flex;align-items:center;justify-content:center;color:#333;overflow:hidden}.container{background:rgba(255,255,255,.95);backdrop-filter:blur(10px);border-radius:20px;padding:20px;box-shadow:0 20px 40px rgba(0,0,0,.1);max-width:800px;width:95%;max-height:90vh;text-align:center;overflow-y:auto;display:flex;flex-direction:column;position:relative}.logout-btn{position:fixed;top:20px;right:20px;background:#a7a0d8;color:#dc2929;border:none;border-radius:8px;padding:8px 16px;font-size:.9rem;font-weight:600;cursor:pointer;z-index:1000}.logout-btn:hover{background:#e0e0e0}.title{font-size:1.8rem;margin-bottom:8px;color:#2d3748}.subtitle{color:#718096;margin-bottom:15px;font-size:.95rem}.info-card{background:#f7fafc;border-radius:12px;padding:15px;margin:10px 0;border-left:3px solid #6ed8c9;flex:1;overflow-y:auto}.info-item{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #e2e8f0;font-size:.85rem}.info-item:last-child{border-bottom:none}.label{font-weight:600;color:#4a5568}.value{color:#14171d;font-family:'Courier New',monospace;background:#edf2f7;padding:4px 8px;border-radius:6px;font-size:.75rem;word-break:break-all}.btn-group{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:15px 0}.btn{padding:10px 20px;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;transition:all .3s;min-width:100px}.btn-secondary{background:linear-gradient(45deg,#68e3d6,#906cc9);color:#001379}.btn:hover{transform:translateY(-2px);box-shadow:0 10px 20px rgba(0,0,0,.1)}.status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#48bb78;margin-right:8px;animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.toast{position:fixed;top:20px;right:20px;background:#f4fcf7;border-left:4px solid #48bb78;border-radius:8px;padding:12px 16px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:1000;opacity:0;transform:translateX(100%);transition:all .3s;max-width:300px}.toast.show{opacity:1;transform:translateX(0)}.footer{margin-top:10px;color:#718096;font-size:.9rem}.footer a{color:#667eea;text-decoration:none;margin:0 8px}@media(max-width:768px){.container{padding:15px}.btn-group{flex-direction:column;align-items:center}.btn{width:100%;max-width:180px}}</style></head><body><button onclick="logout()" class="logout-btn"><i class="fas fa-sign-out-alt"></i> 退出登录</button><div class="container"><div style="font-size:2rem;margin-bottom:-10px"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div><h1 class="title">Shadowsocks Service</h1><p class="subtitle">基于 Cloudflare Workers 的高性能代理服务</p><div class="info-card"><div class="info-item"><span class="label">服务状态</span><span class="value"><span class="status-dot"></span>运行中</span></div><div class="info-item"><span class="label">主机地址</span><span class="value">${host}</span></div><div class="info-item"><span class="label">UUID/密码</span><span class="value">${CONFIG.uuid}</span></div><div class="info-item"><span class="label">订阅地址</span><span class="value">${subUrl}</span></div><div class="info-item"><span class="label">Clash 订阅</span><span class="value">${clashUrl}</span></div><div class="info-item"><span class="label">sing-box 订阅</span><span class="value">${singboxUrl}</span></div></div><div class="btn-group"><button onclick="copyText('${singboxUrl}','sing-box 订阅链接已复制')" class="btn btn-secondary">复制 sing-box</button><button onclick="copyText('${clashUrl}','Clash 订阅链接已复制')" class="btn btn-secondary">复制 Clash</button><button onclick="copyText('${subUrl}','订阅链接已复制')" class="btn btn-secondary">复制订阅</button></div><div class="footer"><a href="https://github.com/eooce/CF-Workers-VLESS" target="_blank">GitHub</a><a href="https://t.me/eooceu" target="_blank">Telegram</a></div></div><div id="toast" class="toast"><span id="toastMsg"></span></div><script>function copyText(url,msg){navigator.clipboard.writeText(url).then(()=>showToast(msg)).catch(()=>{const t=document.createElement('textarea');t.value=url;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);showToast(msg)})}function showToast(m){const t=document.getElementById('toast');document.getElementById('toastMsg').textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1500)}function logout(){if(confirm('确定退出？')){const u=new URL(location.href);u.searchParams.delete('password');location.href=u.toString()}}</script></body></html>`;
+	return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-cache, no-store, must-revalidate' } });
+}
+
+// ---------------------- 订阅生成 ----------------------
+
+function generateSubscription(url) {
+	const currentDomain = url.hostname;
+	const nodes = CONFIG.cfips.map(cdnItem => {
+		let host, port = 443, nodeName = '';
+		const hashIdx = cdnItem.indexOf('#');
+		if (hashIdx > 0) { nodeName = cdnItem.substring(hashIdx + 1); cdnItem = cdnItem.substring(0, hashIdx); }
+		if (cdnItem.startsWith('[')) { const be = cdnItem.indexOf(']:'); if (be > 0) { host = cdnItem.substring(0, be + 1); port = parseInt(cdnItem.substring(be + 2)) || 443; } }
+		else if (cdnItem.includes(':')) { const parts = cdnItem.split(':'); host = parts[0]; port = parseInt(parts[1]) || 443; }
+		else { host = cdnItem; }
+		const label = nodeName ? `${nodeName}-SS` : `CF-SS`;
+		const encodedPath = encodeURIComponent(`/sub?ed=2560`);
+		return `ss://${btoa(CONFIG.uuid)}@${host}:${port}?plugin=obfs-local;obfs=http;obfs-host=${currentDomain}&security=tls#${label}`;
+	});
+	const content = nodes.join('\n');
+	return new Response(btoa(unescape(encodeURIComponent(content))), {
+		headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+	});
 }
