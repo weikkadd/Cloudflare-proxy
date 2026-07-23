@@ -6,16 +6,9 @@
 
 **中文** | [English](README_EN.md)
 
-Telegram交流反馈群组: https://t.me/eooceu
+Telegram交流反馈群组: (https://t.me/+7vuju6yPHYZmNjdh)
 
 基于 Cloudflare Workers & Snippets 的高性能 VLESS+trojan 代理服务
-
-YouTube视频部署教程：https://youtu.be/GEcKz2NoKlM
-
-Shadowsocks部署视频教程：https://youtu.be/hUPN_69Atow
-
-pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
-
 </div>
 
 ## 功能特性
